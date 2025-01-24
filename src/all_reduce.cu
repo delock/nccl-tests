@@ -40,9 +40,75 @@ void AllReduceGetBw(size_t count, int typesize, double sec, double* algBw, doubl
   *busBw = baseBw * factor;
 }
 
-testResult_t AllReduceRunColl(void* sendbuff, void* recvbuff, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream) {
-  NCCLCHECK(ncclAllReduce(sendbuff, recvbuff, count, type, op, comm, stream));
-  return testSuccess;
+__global__ void reduce_kernel(float* recvbuf, float* chunkbuf1, float* chunkbuf2, size_t chunkSize) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < chunkSize) {
+        recvbuf[idx] = chunkbuf1[idx] + chunkbuf2[idx];
+    }
+}
+
+testResult_t AllReduceRunBuiltin(void* sendbuff, void* recvbuff, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream) {
+    NCCLCHECK(ncclAllReduce(sendbuff, recvbuff, count, type, op, comm, stream));
+    return testSuccess;
+}
+
+testResult_t AllReduceRunRing(void* sendbuff, void* recvbuff, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream) {
+    //NCCLCHECK(ncclAllReduce(sendbuff, recvbuff, count, type, op, comm, stream));
+    int rank, nranks;
+    ncclCommUserRank(comm, &rank);
+    ncclCommCount(comm, &nranks);
+
+    // Calculate type size manually (adjust for your ncclDataType_t)
+    size_t typeSize;
+    switch (type) {
+        case ncclFloat: typeSize = sizeof(float); break;
+        case ncclDouble: typeSize = sizeof(double); break;
+        case ncclInt: typeSize = sizeof(int); break;
+        case ncclInt64: typeSize = sizeof(int64_t); break;
+        default: return testInternalError; // Unsupported type
+    }
+
+    // Divide data into chunks for ring communication
+    size_t chunkSize = count / nranks;
+
+    // Copy input buffer to output buffer
+    //cudaMemcpyAsync(recvbuff, sendbuff, count * typeSize, cudaMemcpyDeviceToDevice, stream);
+
+    int sendTo = (rank + 1) % nranks;
+    int recvFrom = (rank - 1 + nranks) % nranks;
+
+    // Step 1: Reduce-Scatter phase
+    for (int step = 0; step < nranks - 1; ++step) {
+        // Temporary buffer in recvbuff
+        size_t recvOffset = ((rank - 1 - step + nranks) % nranks) * chunkSize;
+        size_t sendOffset = ((rank - step + nranks) % nranks) * chunkSize;
+        size_t tempBufOffset = ((rank - 2 - step + 2*nranks) % nranks) * chunkSize;
+
+        if (rank==1) {
+            printf("recvOffset %d, sendOffset %d, tempBufOffset %d\n", recvOffset, sendOffset, tempBufOffset);
+        }
+        // Send current chunk and receive the next chunk
+        NCCLCHECK(ncclSend((char*)(step==0?sendbuff:recvbuff) + sendOffset * typeSize, chunkSize, type, sendTo, comm, stream));
+        // recv to the place that is not used
+        NCCLCHECK(ncclRecv((char*)recvbuff + tempBufOffset * typeSize, chunkSize, type, recvFrom, comm, stream));
+
+        // Perform reduction (sum operation)
+        reduce_kernel<<<(chunkSize + 255) / 256, 256, 0, stream>>>(
+            (float*)recvbuff + recvOffset, (float*)sendbuff+recvOffset, (float*)recvbuff + tempBufOffset, chunkSize);
+        //cudaStreamSynchronize(stream);
+    }
+
+    // Step 2: All-Gather phase
+    for (int step = 0; step < nranks - 1; ++step) {
+        size_t sendOffset = ((rank + 1 - step + nranks) % nranks) * chunkSize;
+        size_t recvOffset = ((rank - step + nranks) % nranks) * chunkSize;
+
+        // Send reduced chunk and receive the next chunk to gather full result
+        NCCLCHECK(ncclSend((char*)recvbuff + sendOffset * typeSize, chunkSize, type, sendTo, comm, stream));
+        NCCLCHECK(ncclRecv((char*)recvbuff + recvOffset * typeSize, chunkSize, type, recvFrom, comm, stream));
+    }
+
+    return testSuccess;
 }
 
 struct testColl allReduceTest = {
@@ -50,7 +116,8 @@ struct testColl allReduceTest = {
   AllReduceGetCollByteCount,
   AllReduceInitData,
   AllReduceGetBw,
-  AllReduceRunColl
+  //AllReduceRunBuiltin
+  AllReduceRunRing
 };
 
 void AllReduceGetBuffSize(size_t *sendcount, size_t *recvcount, size_t count, int nranks) {

@@ -47,19 +47,37 @@ void AlltoAllGetBw(size_t count, int typesize, double sec, double* algBw, double
 
 testResult_t AlltoAllRunColl(void* sendbuff, void* recvbuff, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream) {
   int nRanks;
+  int rank;
   NCCLCHECK(ncclCommCount(comm, &nRanks));
+  NCCLCHECK(ncclCommUserRank(comm, &rank));
+
   size_t rankOffset = count * wordSize(type);
+  float sendBuf = 0;
+  float recvBuf = 0;
 
 #if NCCL_MAJOR < 2 || NCCL_MINOR < 7
   printf("NCCL 2.7 or later is needed for alltoall. This test was compiled with %d.%d.\n", NCCL_MAJOR, NCCL_MINOR);
   return testNcclError;
 #else
-  NCCLCHECK(ncclGroupStart());
   for (int r=0; r<nRanks; r++) {
-    NCCLCHECK(ncclSend(((char*)sendbuff)+r*rankOffset, count, type, r, comm, stream));
-    NCCLCHECK(ncclRecv(((char*)recvbuff)+r*rankOffset, count, type, r, comm, stream));
+    NCCLCHECK(ncclGroupStart());
+    auto to_rank = (rank+r)%nRanks;
+    auto from_rank = (nRanks+rank-r)%nRanks;
+    NCCLCHECK(ncclSend(((char*)sendbuff)+to_rank*rankOffset, count, type, to_rank, comm, stream));
+    NCCLCHECK(ncclRecv(((char*)recvbuff)+from_rank*rankOffset, count, type, from_rank, comm, stream));
+
+    // send recv from rank
+    //NCCLCHECK(ncclSend(((char*)sendbuff)+r*rankOffset, count, type, r, comm, stream));
+    //NCCLCHECK(ncclRecv(((char*)recvbuff)+r*rankOffset, count, type, r, comm, stream));
+
+    // enforce rank = 0
+    //NCCLCHECK(ncclSend(((char*)sendbuff)+0*rankOffset, count, type, 0, comm, stream));
+    //NCCLCHECK(ncclRecv(((char*)recvbuff)+0*rankOffset, count, type, 0, comm, stream));
+
+    NCCLCHECK(ncclGroupEnd());
+    // add barrier
+    NCCLCHECK(ncclAllReduce(&sendBuf, &recvBuf, 0, ncclFloat, ncclSum, comm, stream));
   }
-  NCCLCHECK(ncclGroupEnd());
   return testSuccess;
 #endif
 }
