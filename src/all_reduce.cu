@@ -4,6 +4,7 @@
  * See LICENSE.txt for license information
  ************************************************************************/
 
+#include <stdio.h>
 #include "cuda_runtime.h"
 #include "common.h"
 
@@ -40,11 +41,18 @@ void AllReduceGetBw(size_t count, int typesize, double sec, double* algBw, doubl
   *busBw = baseBw * factor;
 }
 
-__global__ void reduce_kernel(float* recvbuf, float* chunkbuf1, float* chunkbuf2, size_t chunkSize) {
+__global__ void reduce_kernel(float* recvbuf, float* chunkbuf1, float* chunkbuf2) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < chunkSize) {
-        recvbuf[idx] = chunkbuf1[idx] + chunkbuf2[idx];
+    recvbuf[idx] = chunkbuf1[idx] + chunkbuf2[idx];
+    //printf("Thread %d: recvbuf[%d] = %f + %f = %f\n", idx, idx, chunkbuf1[idx], chunkbuf2[idx], recvbuf[idx]);
+}
+
+void print_buffer(const float* buffer, size_t offset, size_t length) {
+    printf("Buffer at offset %zu, length %zu:\n", offset, length);
+    for (size_t i = 0; i < length; ++i) {
+        printf("%f ", buffer[offset + i]);
     }
+    printf("\n");
 }
 
 testResult_t AllReduceRunBuiltin(void* sendbuff, void* recvbuff, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream) {
@@ -77,25 +85,32 @@ testResult_t AllReduceRunRing(void* sendbuff, void* recvbuff, size_t count, nccl
     int sendTo = (rank + 1) % nranks;
     int recvFrom = (rank - 1 + nranks) % nranks;
 
+    //if (rank == 0) print_buffer((float*)sendbuff, 0, count);
     // Step 1: Reduce-Scatter phase
     for (int step = 0; step < nranks - 1; ++step) {
         // Temporary buffer in recvbuff
+        // in this step, we receieve from rank -1, so offset is the offset of rank-1
         size_t recvOffset = ((rank - 1 - step + nranks) % nranks) * chunkSize;
         size_t sendOffset = ((rank - step + nranks) % nranks) * chunkSize;
+        // we believe this place is not used hence can be used for tempBuffer
         size_t tempBufOffset = ((rank - 2 - step + 2*nranks) % nranks) * chunkSize;
 
-        if (rank==1) {
-            printf("recvOffset %d, sendOffset %d, tempBufOffset %d\n", recvOffset, sendOffset, tempBufOffset);
-        }
         // Send current chunk and receive the next chunk
+        // in first step, data comes from send buff
+        // in all coming steps, data comes from recv buff
         NCCLCHECK(ncclSend((char*)(step==0?sendbuff:recvbuff) + sendOffset * typeSize, chunkSize, type, sendTo, comm, stream));
         // recv to the place that is not used
         NCCLCHECK(ncclRecv((char*)recvbuff + tempBufOffset * typeSize, chunkSize, type, recvFrom, comm, stream));
 
+        cudaStreamSynchronize(stream);
         // Perform reduction (sum operation)
-        reduce_kernel<<<(chunkSize + 255) / 256, 256, 0, stream>>>(
-            (float*)recvbuff + recvOffset, (float*)sendbuff+recvOffset, (float*)recvbuff + tempBufOffset, chunkSize);
-        //cudaStreamSynchronize(stream);
+        dim3 blockSize(256);
+        dim3 gridSize((chunkSize + blockSize.x - 1) / blockSize.x);
+        reduce_kernel<<<gridSize, blockSize, 0, stream>>>(
+            (float*)recvbuff + recvOffset, // store result in recvbuff
+            (float*)sendbuff + recvOffset, // source is in sendbuff
+            (float*)recvbuff + tempBufOffset); // the chunk just receieved
+        cudaStreamSynchronize(stream);
     }
 
     // Step 2: All-Gather phase
@@ -106,6 +121,7 @@ testResult_t AllReduceRunRing(void* sendbuff, void* recvbuff, size_t count, nccl
         // Send reduced chunk and receive the next chunk to gather full result
         NCCLCHECK(ncclSend((char*)recvbuff + sendOffset * typeSize, chunkSize, type, sendTo, comm, stream));
         NCCLCHECK(ncclRecv((char*)recvbuff + recvOffset * typeSize, chunkSize, type, recvFrom, comm, stream));
+        cudaStreamSynchronize(stream);
     }
 
     return testSuccess;
